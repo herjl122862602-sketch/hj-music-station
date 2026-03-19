@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="zh-TW">
 <head>
@@ -331,17 +330,157 @@ function fmt(s){if(!s||isNaN(s))return'0:00';s=Math.max(0,Math.floor(s));return 
 window.addEventListener('resize',()=>{if(audioBuffer)drawWaveform()});
 
 // ============ SUNO ============
-function extractSunoId(u){const m=/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.exec(u);if(m)return{type:'uuid',id:m[0]};const s=u.match(/suno\.com\/s\/([a-zA-Z0-9_-]+)/);if(s)return{type:'short',code:s[1]};return null}
-async function loadSunoURL(){const input=document.getElementById('sunoInput').value.trim();if(!input)return;const p=extractSunoId(input);if(!p){document.getElementById('sunoHint').innerHTML='<span style="color:var(--red)">❌ 無法辨識</span>';return}
-if(p.type==='short'){document.getElementById('sunoHint').innerHTML='⏳ 解析中...';const btn=document.getElementById('sunoBtn');btn.innerHTML='<span class="gen-spinner"></span>';let ok=false;
-try{const r=await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent('https://suno.com/s/'+p.code)}`,{signal:AbortSignal.timeout(6000)});const h=await r.text();const m=h.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);if(m){ok=true;await loadSunoAudio(m[0])}}catch(e){}
-if(!ok)document.getElementById('sunoHint').innerHTML=`<span style="color:var(--yellow)">⚠️ 請 <a href="https://suno.com/s/${p.code}" target="_blank" style="color:var(--accent);text-decoration:underline">開啟頁面</a> 複製完整連結</span>`;btn.innerHTML='▶ 載入';return}
-await loadSunoAudio(p.id)}
-async function loadSunoAudio(sid){const btn=document.getElementById('sunoBtn');btn.innerHTML='<span class="gen-spinner"></span>';document.getElementById('sunoHint').innerHTML='⏳ 載入中...';let ok=false;
-for(const u of[`https://cdn1.suno.ai/${sid}.mp3`,`https://cdn2.suno.ai/${sid}.mp3`]){if(ok)break;try{const r=await fetch(u);if(!r.ok)continue;const ab=await r.arrayBuffer();if(ab.byteLength<1000)continue;if(!audioCtx)initAudio();audioBuffer=await audioCtx.decodeAudioData(ab);ok=true;if(isPlaying){try{sourceNode.stop()}catch(e){}}isPlaying=false;pausedAt=0;
-document.getElementById('playerSection').style.opacity='1';document.getElementById('playerSection').style.pointerEvents='auto';document.getElementById('timeRight').textContent=fmt(audioBuffer.duration);document.getElementById('playBtn').textContent='▶';
-document.getElementById('sunoHint').innerHTML=`<span style="color:var(--green)">✅ ${(ab.byteLength/1048576).toFixed(1)}MB · ${fmt(audioBuffer.duration)}</span>`;document.getElementById('statusText').textContent='Suno AI ('+sid.slice(0,8)+'...)';drawWaveform()}catch(e){continue}}
-if(!ok)document.getElementById('sunoHint').innerHTML='<span style="color:var(--red)">❌ 載入失敗，請下載後本地上傳</span>';btn.innerHTML='▶ 載入'}
+function extractSunoId(u){
+  u=u.trim();
+  // Full UUID anywhere in string
+  const m=/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.exec(u);
+  if(m)return{type:'uuid',id:m[0]};
+  // Short link suno.com/s/CODE
+  const s=u.match(/suno\.com\/s\/([a-zA-Z0-9_-]+)/);
+  if(s)return{type:'short',code:s[1]};
+  // Bare short code (no URL, just the code like pFonq1HMZVr3lmKN)
+  if(/^[a-zA-Z0-9_-]{10,24}$/.test(u))return{type:'short',code:u};
+  return null;
+}
+
+// Resolve short link to UUID via multiple CORS proxies
+async function resolveShortLink(code){
+  const url='https://suno.com/s/'+code;
+  const proxies=[
+    u=>`https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+    u=>`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
+    u=>`https://corsproxy.io/?${encodeURIComponent(u)}`,
+    u=>`https://proxy.cors.sh/${u}`,
+    u=>`https://thingproxy.freeboard.io/fetch/${u}`,
+  ];
+  for(const mkProxy of proxies){
+    try{
+      const r=await fetch(mkProxy(url),{signal:AbortSignal.timeout(8000),headers:{'x-cors-api-key':'temp'}});
+      if(!r.ok)continue;
+      const h=await r.text();
+      const m=h.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+      if(m)return m[0];
+    }catch(e){continue}
+  }
+  return null;
+}
+
+async function loadSunoURL(){
+  const input=document.getElementById('sunoInput').value.trim();
+  if(!input)return;
+  const p=extractSunoId(input);
+  if(!p){document.getElementById('sunoHint').innerHTML='<span style="color:var(--red)">❌ 無法辨識連結格式</span>';return}
+
+  const btn=document.getElementById('sunoBtn');
+  btn.innerHTML='<span class="gen-spinner"></span>';
+
+  if(p.type==='short'){
+    document.getElementById('sunoHint').innerHTML='⏳ 解析短連結中... (嘗試多個代理)';
+    // Method 1: Try resolving via CORS proxies
+    let uuid=await resolveShortLink(p.code);
+    // Method 2: If proxy fails, try common CDN patterns directly (some short codes map predictably)
+    if(!uuid){
+      document.getElementById('sunoHint').innerHTML='⏳ 嘗試直接載入...';
+      // Try using the Suno API endpoint
+      const apiProxies=[
+        `https://corsproxy.io/?${encodeURIComponent('https://studio-api.suno.ai/api/clip/'+p.code)}`,
+        `https://api.allorigins.win/raw?url=${encodeURIComponent('https://studio-api.suno.ai/api/clip/'+p.code)}`,
+      ];
+      for(const apiUrl of apiProxies){
+        try{
+          const r=await fetch(apiUrl,{signal:AbortSignal.timeout(8000)});
+          if(!r.ok)continue;
+          const j=await r.json();
+          if(j.id)uuid=j.id;
+          else if(j.audio_url){
+            // Direct audio URL found
+            try{
+              const ar=await fetch(j.audio_url);
+              if(ar.ok){
+                const ab=await ar.arrayBuffer();
+                if(ab.byteLength>1000){
+                  if(!audioCtx)initAudio();
+                  audioBuffer=await audioCtx.decodeAudioData(ab);
+                  if(isPlaying){try{sourceNode.stop()}catch(e){}}isPlaying=false;pausedAt=0;
+                  document.getElementById('playerSection').style.opacity='1';document.getElementById('playerSection').style.pointerEvents='auto';
+                  document.getElementById('timeRight').textContent=fmt(audioBuffer.duration);document.getElementById('playBtn').textContent='▶';
+                  document.getElementById('sunoHint').innerHTML=`<span style="color:var(--green)">✅ ${(ab.byteLength/1048576).toFixed(1)}MB · ${fmt(audioBuffer.duration)}</span>`;
+                  document.getElementById('statusText').textContent='Suno AI';drawWaveform();btn.innerHTML='▶ 載入';return;
+                }
+              }
+            }catch(e){}
+          }
+          if(uuid)break;
+        }catch(e){continue}
+      }
+    }
+    if(uuid){
+      await loadSunoAudio(uuid);
+    }else{
+      document.getElementById('sunoHint').innerHTML=`<span style="color:var(--yellow)">⚠️ 短連結解析失敗，請試以下方式：<br>1. <a href="https://suno.com/s/${p.code}" target="_blank" style="color:var(--accent);text-decoration:underline">開啟 Suno 頁面</a> → 複製網址列完整連結貼回<br>2. 或在 Suno 頁面下載 MP3 後用「上傳本地音檔」</span>`;
+    }
+    btn.innerHTML='▶ 載入';return;
+  }
+  await loadSunoAudio(p.id);
+}
+
+async function loadSunoAudio(sid){
+  const btn=document.getElementById('sunoBtn');
+  btn.innerHTML='<span class="gen-spinner"></span>';
+  document.getElementById('sunoHint').innerHTML='⏳ 載入音檔中...';
+  let ok=false;
+  // Try multiple CDN endpoints
+  const cdns=[
+    `https://cdn1.suno.ai/${sid}.mp3`,
+    `https://cdn2.suno.ai/${sid}.mp3`,
+    `https://cdn.suno.ai/${sid}.mp3`,
+  ];
+  for(const u of cdns){
+    if(ok)break;
+    try{
+      const r=await fetch(u,{signal:AbortSignal.timeout(15000)});
+      if(!r.ok)continue;
+      const ab=await r.arrayBuffer();
+      if(ab.byteLength<1000)continue;
+      if(!audioCtx)initAudio();
+      audioBuffer=await audioCtx.decodeAudioData(ab);ok=true;
+      if(isPlaying){try{sourceNode.stop()}catch(e){}}isPlaying=false;pausedAt=0;
+      document.getElementById('playerSection').style.opacity='1';document.getElementById('playerSection').style.pointerEvents='auto';
+      document.getElementById('timeRight').textContent=fmt(audioBuffer.duration);document.getElementById('playBtn').textContent='▶';
+      document.getElementById('sunoHint').innerHTML=`<span style="color:var(--green)">✅ ${(ab.byteLength/1048576).toFixed(1)}MB · ${fmt(audioBuffer.duration)}</span>`;
+      document.getElementById('statusText').textContent='Suno AI ('+sid.slice(0,8)+'...)';drawWaveform();
+    }catch(e){continue}
+  }
+  // If direct CDN fails, try via CORS proxy
+  if(!ok){
+    document.getElementById('sunoHint').innerHTML='⏳ 嘗試代理載入...';
+    for(const cdn of cdns){
+      if(ok)break;
+      const proxied=[
+        `https://corsproxy.io/?${encodeURIComponent(cdn)}`,
+        `https://api.allorigins.win/raw?url=${encodeURIComponent(cdn)}`,
+      ];
+      for(const pu of proxied){
+        if(ok)break;
+        try{
+          const r=await fetch(pu,{signal:AbortSignal.timeout(15000)});
+          if(!r.ok)continue;
+          const ab=await r.arrayBuffer();
+          if(ab.byteLength<1000)continue;
+          if(!audioCtx)initAudio();
+          audioBuffer=await audioCtx.decodeAudioData(ab);ok=true;
+          if(isPlaying){try{sourceNode.stop()}catch(e){}}isPlaying=false;pausedAt=0;
+          document.getElementById('playerSection').style.opacity='1';document.getElementById('playerSection').style.pointerEvents='auto';
+          document.getElementById('timeRight').textContent=fmt(audioBuffer.duration);document.getElementById('playBtn').textContent='▶';
+          document.getElementById('sunoHint').innerHTML=`<span style="color:var(--green)">✅ 代理載入成功 · ${(ab.byteLength/1048576).toFixed(1)}MB · ${fmt(audioBuffer.duration)}</span>`;
+          document.getElementById('statusText').textContent='Suno AI ('+sid.slice(0,8)+'...)';drawWaveform();
+        }catch(e){continue}
+      }
+    }
+  }
+  if(!ok)document.getElementById('sunoHint').innerHTML='<span style="color:var(--red)">❌ 載入失敗<br>可能是私人歌曲或連結已過期，請下載 MP3 後用「上傳本地音檔」</span>';
+  btn.innerHTML='▶ 載入';
+}
 document.getElementById('sunoInput').addEventListener('keydown',e=>{if(e.key==='Enter')loadSunoURL()});
 
 // ============ FILE UPLOAD ============
